@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::process::Command;
 use std::{env, error::Error};
-use tokio::io;
 use tokio::net::UdpSocket;
+use tokio::{fs, io};
 use tokio_util::codec::{BytesCodec, FramedRead, FramedWrite};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -16,13 +16,20 @@ enum Events {
     Kill(),
     Start(),
     Restart(),
+    Success(),
     AddProccess {
         command: String,
         pwd: String,
         args: Vec<String>,
+        name: String,
     },
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[test]
+fn test_event() {
+    println!("{}", serde_json::to_string(&Events::Kill()).unwrap())
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 
 struct Proccess {
     id: u32,
@@ -34,7 +41,7 @@ struct Proccess {
     enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Config {
     proccesses: Vec<Proccess>,
 }
@@ -48,24 +55,40 @@ async fn connect(addr: &SocketAddr) -> Result<UdpSocket, Box<dyn Error>> {
 
     let socket = UdpSocket::bind(&bind_addr).await?;
     socket.connect(addr).await?;
-    // socket.send(&serde_json::to_vec(&Events::Kill())?).await?;
-
-    // recv(stdout, &socket).await?;
 
     Ok(socket)
 }
 
-async fn add_proccess(command: String, pwd: String, args: Vec<String>) -> Proccess {
+async fn get_config() -> Config {
+    fs::create_dir_all("~/.qpm/logs").await.unwrap();
+    let res = fs::read_to_string("~/.qpm/config.json")
+        .await
+        .unwrap_or_default();
+
+    serde_json::from_str(&res).unwrap_or_default()
+}
+async fn set_config(config: Config) {
+    fs::create_dir_all("~/.qpm/logs").await.unwrap();
+    fs::write(
+        "~/.qpm/config.json",
+        serde_json::to_string(&config).unwrap(),
+    )
+    .await
+    .expect("Failed to write config!");
+}
+async fn add_proccess(name: String, command: String, pwd: String, args: Vec<String>) -> Proccess {
     let prc = Proccess {
         id: 0,
         ts: 0,
-        name: "".to_string(),
-        command: command,
-        args: args,
-        pwd: pwd,
+        name,
+        command,
+        args,
+        pwd,
         enabled: true,
     };
-
+    let mut config = get_config().await;
+    config.proccesses.push(prc.clone());
+    set_config(config).await;
     prc
 }
 async fn start_proccess(prc: &Proccess) {
@@ -74,31 +97,6 @@ async fn start_proccess(prc: &Proccess) {
         .args(&prc.args)
         .spawn()
         .expect("failed to execute process");
-}
-async fn send(
-    mut stdin: impl Stream<Item = Result<Bytes, io::Error>> + Unpin,
-    writer: &UdpSocket,
-) -> Result<(), io::Error> {
-    while let Some(item) = stdin.next().await {
-        let buf = item?;
-        writer.send(&buf[..]).await?;
-    }
-
-    Ok(())
-}
-
-async fn recv(
-    mut stdout: impl Sink<Bytes, Error = io::Error> + Unpin,
-    reader: &UdpSocket,
-) -> Result<(), io::Error> {
-    loop {
-        let mut buf = vec![0; 1024];
-        let n = reader.recv(&mut buf[..]).await?;
-
-        if n > 0 {
-            stdout.send(Bytes::from(buf)).await?;
-        }
-    }
 }
 
 struct UdpServer {
@@ -116,27 +114,32 @@ impl UdpServer {
         } = self;
 
         loop {
-            // First we check to see if there's a message we need to echo back.
-            // If so then we try to send it back to the original source, waiting
-            // until it's writable and we're able to do so.
             if let Some((size, peer)) = to_send {
                 let event: Events = serde_json::from_slice(&buf[..size])?;
                 println!("{event:?}");
                 match event {
                     Events::Kill() => {
+                        socket
+                            .send_to(&serde_json::to_vec_pretty(&Events::Success())?, &peer)
+                            .await?;
                         std::process::exit(0);
                     }
-                    Events::AddProccess { command, pwd, args } => {
-                        let prc = add_proccess(command, pwd, args).await;
-                        start_proccess(&prc).await;
+                    Events::AddProccess {
+                        command,
+                        pwd,
+                        args,
+                        name,
+                    } => {
+                        let prc = add_proccess(name, command, pwd, args).await;
+                        tokio::spawn(async move {
+                            start_proccess(&prc).await;
+                        });
                     }
                     _ => {}
                 }
-                let amt = socket.send_to(&buf[..size], &peer).await?;
+                // let amt = socket.send_to(&buf[..size], &peer).await?;
             }
 
-            // If we're here then `to_send` is `None`, so we take a look for the
-            // next message we're going to echo back.
             to_send = Some(socket.recv_from(&mut buf).await?);
         }
     }
@@ -163,11 +166,16 @@ struct Server {}
 #[derive(Args)]
 struct Kill {}
 
+const MAX_DATAGRAM_SIZE: usize = 65_507;
+
 #[derive(Args)]
 struct Start {
     command: String,
+    args: Vec<String>,
     #[clap(short, long)]
     pwd: Option<String>,
+    #[clap(short, long)]
+    name: String,
 }
 
 #[tokio::main]
@@ -179,30 +187,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let socket = UdpSocket::bind(addr).await?;
             println!("Listening on: {}", socket.local_addr()?);
 
+            for prc in get_config().await.proccesses {
+                tokio::spawn(async move {
+                    start_proccess(&prc).await;
+                });
+            }
+
             let server = UdpServer {
                 socket,
                 buf: vec![0; 1024],
                 to_send: None,
             };
 
-            // This starts the server task.
             server.run().await?;
         }
         Commands::Kill(..) => {
             let addr = addr.parse::<SocketAddr>()?;
             let sock = connect(&addr).await?;
             sock.send(&serde_json::to_vec(&Events::Kill())?).await?;
-            // let stdin = FramedRead::new(io::stdin(), BytesCodec::new());
-            // let stdin = stdin.map(|i| i.map(|bytes| bytes.freeze()));
-            // let stdout = FramedWrite::new(io::stdout(), BytesCodec::new());
-            // let addr = addr.parse::<SocketAddr>()?;
 
-            // connect(&addr, stdin, stdout).await?;
+            let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
+            let res = sock.recv(&mut buf).await?;
+            println!("{}", String::from_utf8_lossy(&buf));
+            println!(
+                "{:?}",
+                serde_json::from_str::<Events>(&String::from_utf8_lossy(&buf).trim())?
+            );
         }
-        Commands::Start(Start { command, pwd }) => {
+        Commands::Start(Start {
+            command,
+            pwd,
+            name,
+            args,
+        }) => {
             let addr = addr.parse::<SocketAddr>()?;
             let sock = connect(&addr).await?;
             sock.send(&serde_json::to_vec(&Events::AddProccess {
+                name,
                 command,
                 pwd: pwd.unwrap_or_else(|| {
                     env::current_dir()
@@ -211,7 +232,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .to_string_lossy()
                         .to_string()
                 }),
-                args: vec![],
+                args: args,
             })?)
             .await?;
         }
